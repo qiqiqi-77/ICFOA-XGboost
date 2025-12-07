@@ -1,0 +1,235 @@
+import numpy as np
+from scipy.special import gamma
+from tqdm import tqdm
+from hashlib import sha256        
+
+
+fitness_cache = {}
+def cached_fitness(fobj, x_train_all, x_val_unused, y_train_all, y_val_unused, x):
+    key = tuple(np.round(x, 4))  # 更快的键生成方式（避免不必要的哈希计算）
+    if key in fitness_cache:
+        return fitness_cache[key]
+    try:
+        val = fobj(x_train_all, x_val_unused, y_train_all, y_val_unused, x)
+    except Exception as e:
+        print(f"适应度计算出错: {e}")
+        val = float('inf')
+    fitness_cache[key] = val
+    return val
+
+def initialization(SearchAgents_no, dim, ub, lb):
+    """初始化鱼群位置，支持标量和数组形式的边界"""
+    lb = np.full(dim, lb) if np.isscalar(lb) else lb
+    ub = np.full(dim, ub) if np.isscalar(ub) else ub
+    return np.random.uniform(lb, ub, (SearchAgents_no, dim))
+
+def reverse_learning_initialization(SearchAgents_no, dim, ub, lb, fobj, x_train_all, x_val_unused, y_train_all, y_val_unused):
+    """基于反向学习的初始化方法，生成更优的初始种群"""
+    lb = np.full(dim, lb) if np.isscalar(lb) else lb
+    ub = np.full(dim, ub) if np.isscalar(ub) else ub
+
+    random_pop = np.random.uniform(lb, ub, (SearchAgents_no, dim))
+    reverse_pop = lb + ub - random_pop
+
+    def ensure_valid_params(population):
+        population[:, 1] = np.maximum(3, population[:, 1])
+        population[:, 2] = np.maximum(50, population[:, 2])
+        return np.clip(population, lb, ub)
+
+    random_pop = ensure_valid_params(random_pop)
+    reverse_pop = ensure_valid_params(reverse_pop)
+
+    combined_pop = np.vstack((random_pop, reverse_pop))
+    fitness = np.zeros(combined_pop.shape[0])
+
+    for i in range(combined_pop.shape[0]):
+        try:
+            fitness[i] = cached_fitness(fobj, x_train_all, x_val_unused, y_train_all, y_val_unused, combined_pop[i])
+        except Exception as e:
+            print(f"计算第{i}个个体适应度时出错: {e}")
+            fitness[i] = float('inf')
+
+    return combined_pop[np.argsort(fitness)[:SearchAgents_no]]
+
+def levy_flight(dim, scale=1.0):
+    beta = 1.5
+    sigma = (gamma(1 + beta) * np.sin(np.pi * beta / 2) /
+             (gamma((1 + beta) / 2) * beta * 2 ** ((beta - 1) / 2))) ** (1 / beta)
+    return scale * (np.random.randn(dim) * sigma) / np.abs(np.random.randn(dim))**(1/beta)
+
+def local_search(agent, best_pos, dim, fobj, lb, ub, x_train_all, x_val_unused, y_train_all, y_val_unused, max_local=10):
+    current_pos = agent.copy()
+  
+    current_fit = cached_fitness(fobj, x_train_all, x_val_unused, y_train_all, y_val_unused, current_pos)
+
+    for _ in range(max_local):
+        neighbor = current_pos + np.random.normal(0, 0.1, dim)
+        neighbor = np.clip(neighbor, lb, ub)
+        neighbor_fit = cached_fitness(fobj, x_train_all, x_val_unused, y_train_all, y_val_unused, neighbor)
+
+        if neighbor_fit < current_fit:
+            current_pos, current_fit = neighbor, neighbor_fit
+
+        improve_pos = current_pos + 0.5 * (best_pos - current_pos)
+        improve_pos = np.clip(improve_pos, lb, ub)
+        improve_fit = cached_fitness(fobj, x_train_all, x_val_unused, y_train_all, y_val_unused, improve_pos)
+
+        if improve_fit < current_fit:
+            current_pos, current_fit = improve_pos, improve_fit
+
+    return current_pos, current_fit
+
+def ICFOA(SearchAgents_no, Max_EFs, lb, ub, dim, fobj, x_train_all, x_val_unused, y_train_all, y_val_unused,
+          local_search_flag=True, local_search_progress=0.7):
+    lb = np.full(dim, lb) if np.isscalar(lb) else lb
+    ub = np.full(dim, ub) if np.isscalar(ub) else ub
+
+    Fisher = reverse_learning_initialization(SearchAgents_no, dim, ub, lb, fobj, x_train_all, x_val_unused, y_train_all, y_val_unused)
+    newFisher = Fisher.copy()
+    EFs = 0
+    Best_score = float('inf')
+    Best_pos = np.zeros(dim)
+    cg_curve = np.zeros(Max_EFs)
+    fit = np.full(SearchAgents_no, float('inf'))
+    newfit = fit.copy()
+
+    alpha_pos, alpha_score = np.zeros(dim), float('inf')
+    beta_pos, beta_score = np.zeros(dim), float('inf')
+    delta_pos, delta_score = np.zeros(dim), float('inf')
+
+    elite_size = max(1, int(SearchAgents_no * 0.2))
+    elite_pos = np.zeros((elite_size, dim))
+    elite_fit = np.full(elite_size, float('inf'))
+
+    print(f"开始优化，种群大小: {SearchAgents_no}, 最大迭代: {Max_EFs}")
+
+
+    for EFs in tqdm(range(1, Max_EFs+1), desc="IICFOA优化"):
+
+        progress = EFs / Max_EFs
+        a = 2 * (1 - progress)
+        gwo_weight = 0.8 - 0.6 * progress
+        cfoa_weight = 0.2 + 0.6 * progress
+        levy_scale = 0.5 * (1 - progress) + 0.1
+
+        # 批量边界处理
+        newFisher = np.clip(newFisher, lb, ub)
+
+        # 批量适应度计算
+        for i in range(SearchAgents_no):
+            try:
+                newfit[i] = cached_fitness(fobj, x_train_all, x_val_unused, y_train_all, y_val_unused, newFisher[i])
+            except Exception as e:
+                print(f"轮次{EFs}, 个体{i}适应度计算错误: {e}")
+                newfit[i] = float('inf')
+
+        # 更新个体最优和全局最优
+        for i in range(SearchAgents_no):
+            if newfit[i] < fit[i]:
+                fit[i], Fisher[i] = newfit[i], newFisher[i].copy()
+                if newfit[i] < Best_score:
+                    Best_score, Best_pos = newfit[i], Fisher[i].copy()
+
+            # 更新灰狼层级
+            if newfit[i] < alpha_score:
+                delta_score, delta_pos = beta_score, beta_pos.copy()
+                beta_score, beta_pos = alpha_score, alpha_pos.copy()
+                alpha_score, alpha_pos = newfit[i], Fisher[i].copy()
+            elif newfit[i] < beta_score:
+                delta_score, delta_pos = beta_score, beta_pos.copy()
+                beta_score, beta_pos = newfit[i], Fisher[i].copy()
+            elif newfit[i] < delta_score:
+                delta_score, delta_pos = newfit[i], Fisher[i].copy()
+
+        # 更新精英库（使用numpy加速）
+        for i in range(SearchAgents_no):
+            if newfit[i] < elite_fit.max():
+                worst_idx = np.argmax(elite_fit)
+                elite_pos[worst_idx], elite_fit[worst_idx] = Fisher[i].copy(), newfit[i]
+
+        # 精英信息共享
+        if EFs % 5 == 0:
+            elite_mean = elite_pos.mean(axis=0)
+            Fisher = 0.1 * Fisher + 0.9 * elite_mean
+            Fisher = np.clip(Fisher, lb, ub)
+            for i in range(SearchAgents_no):
+                fit[i] = cached_fitness(fobj, x_train_all, x_val_unused, y_train_all, y_val_unused, Fisher[i])
+                if fit[i] < Best_score:
+                    Best_score, Best_pos = fit[i], Fisher[i].copy()
+
+        # 混合优化策略
+        for i in range(SearchAgents_no):
+            # GWO位置更新
+            r1, r2 = np.random.rand(2)
+            A1, C1 = 2 * a * r1 - a, 2 * r2
+            r1, r2 = np.random.rand(2)
+            A2, C2 = 2 * a * r1 - a, 2 * r2
+            r1, r2 = np.random.rand(2)
+            A3, C3 = 2 * a * r1 - a, 2 * r2
+
+            D_alpha = np.abs(C1 * alpha_pos - Fisher[i])
+            D_beta = np.abs(C2 * beta_pos - Fisher[i])
+            D_delta = np.abs(C3 * delta_pos - Fisher[i])
+
+            X1 = alpha_pos - A1 * D_alpha
+            X2 = beta_pos - A2 * D_beta
+            X3 = delta_pos - A3 * D_delta
+            X_gwo = (X1 + X2 + X3) / 3
+
+            # ICFOA位置更新
+            if progress < 0.4:
+                elite_idx = np.random.randint(0, elite_size)
+                X_cfoa = Fisher[i] + 0.5 * (elite_pos[elite_idx] - Fisher[i]) + levy_flight(dim, levy_scale)
+            elif progress < 0.7:
+                per = np.random.randint(1, 2)
+                group_indices = np.random.choice(SearchAgents_no, per, replace=False)
+                group_center = Fisher[group_indices].mean(axis=0)
+                X_cfoa = Fisher[i] + 0.3 * (group_center - Fisher[i]) + 0.5 * levy_flight(dim, levy_scale)
+            else:
+                sigma = 0.1 * (1 - progress)
+                X_cfoa = Best_pos + sigma * np.random.normal(0, 1, dim)
+
+            # 混合策略融合
+            hybrid_pos = gwo_weight * X_gwo + cfoa_weight * X_cfoa
+            elite_best_idx = np.argmin(elite_fit)
+            guided_pos = 0.7 * hybrid_pos + 0.3 * elite_pos[elite_best_idx]
+            new_pos = np.clip(guided_pos, lb, ub)
+
+            # 评估新位置（使用缓存）
+            new_fit = cached_fitness(fobj, x_train_all, x_val_unused, y_train_all, y_val_unused, new_pos)
+            if new_fit < fit[i]:
+                Fisher[i], fit[i] = new_pos, new_fit
+                if new_fit < Best_score:
+                    Best_score, Best_pos = new_fit, new_pos.copy()
+
+            # 局部搜索增强（只对前20%精英个体，30%概率触发，步数为3）
+            if (
+                local_search_flag
+                and progress > local_search_progress
+                and i < elite_size
+                and np.random.rand() < 0.3
+            ):
+                improved_pos, improved_fit = local_search(
+                    Fisher[i], Best_pos, dim, fobj, lb, ub,
+                    x_train_all, x_val_unused, y_train_all, y_val_unused, max_local=3
+                )
+                if improved_fit < fit[i]:
+                    Fisher[i], fit[i] = improved_pos, improved_fit
+                    if improved_fit < Best_score:
+                        Best_score, Best_pos = improved_fit, improved_pos.copy()
+
+        cg_curve[EFs-1] = Best_score
+        accuracy = 1 - Best_score
+        tqdm.write(f"轮次 {EFs}/{Max_EFs}, 准确率: {accuracy:.4f}")
+
+    # 最终局部搜索
+    final_pos, final_fit = local_search(
+        Best_pos, Best_pos, dim, fobj, lb, ub,
+        x_train_all, x_val_unused, y_train_all, y_val_unused, max_local=3
+    )
+    if final_fit < Best_score:          
+        Best_score = final_fit
+        Best_pos   = final_pos
+
+    print(f"优化完成，最终准确率: {1 - Best_score:.4f}")
+    return Best_score, Best_pos, cg_curve

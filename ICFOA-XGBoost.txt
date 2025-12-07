@@ -1,0 +1,257 @@
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+import numpy as np
+import pandas as pd
+import xgboost as xgb
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    classification_report,
+    confusion_matrix,
+    roc_curve,
+    roc_auc_score
+)
+import matplotlib.pyplot as plt
+import scikitplot as skplt
+import seaborn as sns
+from sklearn.preprocessing import StandardScaler, label_binarize
+from sklearn.model_selection import StratifiedShuffleSplit
+from IICFOA import ICFOA
+import gc
+import warnings
+import joblib   # 保存模型和标准化器
+
+warnings.filterwarnings("ignore", message="`early_stopping_rounds` in `fit` method is deprecated")
+
+# =============== 路径配置 ===============
+train_path = r"E:\Python File\阿七文件\train.xlsx"
+test_path  = r"E:\Python File\阿七文件\test.xlsx"
+save_path  = r"E:\Python File\result\结果"
+os.makedirs(save_path, exist_ok=True)
+
+# =============== 读取数据 ===============
+df_train = pd.read_excel(train_path)
+df_test  = pd.read_excel(test_path)
+
+X_raw_all  = df_train.iloc[:, :10].values
+y_all      = df_train.iloc[:, 10].values - 1   # 标签 1-4 → 0-3
+X_test_raw = df_test.iloc[:, :10].values
+y_test     = df_test.iloc[:, 10].values - 1
+
+# =============== ICFOA 搜索空间 ===============
+min_bound = np.array([0.0, 1,  50, 0.8, 0.8])
+max_bound = np.array([1.0, 15, 400, 1.0, 1.0])
+dim = 5
+
+# =============== 内层“重复留出”参数 ===============
+N_REPEATS = 3
+INNER_VAL_FRAC = 0.2
+EARLY_STOP_ROUNDS = 50
+RANDOM_BASE = 42
+
+# =============== ICFOA 目标函数 ===============
+def optimizeXGBoost(x_train_raw_all, x_test_raw_unused, y_train_all, y_test_unused, crowPosition):
+    lr    = float(crowPosition[0])
+    depth = int(round(crowPosition[1]))
+    n_est = int(round(crowPosition[2]))
+    subs  = float(crowPosition[3])
+    colbt = float(crowPosition[4])
+
+    n_est = max(10, n_est)
+    depth = max(1, depth)
+    subs  = float(np.clip(subs,  0.5, 1.0))
+    colbt = float(np.clip(colbt, 0.5, 1.0))
+
+    val_scores = []
+
+    for r in range(N_REPEATS):
+        sss_inner = StratifiedShuffleSplit(
+            n_splits=1,
+            test_size=INNER_VAL_FRAC,
+            random_state=RANDOM_BASE + r
+        )
+
+        (tr_idx, va_idx), = sss_inner.split(x_train_raw_all, y_train_all)
+
+        X_tr_raw = x_train_raw_all[tr_idx]
+        X_va_raw = x_train_raw_all[va_idx]
+        y_tr     = y_train_all[tr_idx]
+        y_va     = y_train_all[va_idx]
+
+        scaler = StandardScaler()
+        X_tr = scaler.fit_transform(X_tr_raw)
+        X_va = scaler.transform(X_va_raw)
+
+        model = xgb.XGBClassifier(
+            objective='multi:softprob',
+            num_class=4,
+            learning_rate=lr,
+            max_depth=depth,
+            n_estimators=n_est,
+            subsample=subs,
+            colsample_bytree=colbt,
+            tree_method='gpu_hist',
+            predictor='gpu_predictor',
+            random_state=RANDOM_BASE,
+            eval_metric='mlogloss',
+            verbosity=0,
+            early_stopping_rounds=EARLY_STOP_ROUNDS
+        )
+
+        model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+
+        y_va_pred = np.argmax(model.predict_proba(X_va), axis=1)
+        val_scores.append(accuracy_score(y_va, y_va_pred))
+
+        del model, scaler, X_tr_raw, X_va_raw, X_tr, X_va, y_tr, y_va, y_va_pred
+        gc.collect()
+
+    mean_inner_val_acc = float(np.mean(val_scores))
+    fitness = 1.0 - mean_inner_val_acc
+    return fitness
+
+# =============== 运行 ICFOA 优化 ===============
+n_crows = 20
+n_iterations = 50
+
+best_fitness, best_position, fitness_history = ICFOA(
+    n_crows, n_iterations,
+    min_bound, max_bound, dim,
+    optimizeXGBoost,
+    X_raw_all, X_test_raw,
+    y_all, y_test
+)
+
+# 保存适应度曲线数据
+accuracy_history = [1 - f for f in fitness_history]
+fitness_data = np.column_stack((
+    np.arange(1, len(fitness_history) + 1),
+    fitness_history,
+    accuracy_history
+))
+fitness_df = pd.DataFrame(fitness_data, columns=['迭代轮次', '适应度', '内层验证均值准确率'])
+fitness_df.to_csv(os.path.join(save_path, 'fitness_curve_data.csv'), index=False)
+
+plt.figure(figsize=(10, 6))
+plt.plot(range(1, n_iterations + 1), fitness_history, 'b-', linewidth=2)
+plt.xlabel('迭代轮次')
+plt.ylabel('适应度(1-mean_inner_val_acc)')
+plt.title('ICFOA 优化过程中的适应度曲线')
+plt.grid(True)
+plt.savefig(os.path.join(save_path, 'fitness_curve.png'))
+plt.show()
+
+# =============== 提取最优参数 ===============
+learning_rate    = float(best_position[0])
+max_depth        = int(round(best_position[1]))
+n_estimators     = int(round(best_position[2]))
+subsample        = float(best_position[3])
+colsample_bytree = float(best_position[4])
+
+n_estimators = max(10, n_estimators)
+max_depth    = max(1, max_depth)
+
+with open(os.path.join(save_path, "best_parameters.txt"), "w") as f:
+    f.write(f"learning_rate: {learning_rate:.6f}\n")
+    f.write(f"max_depth: {max_depth}\n")
+    f.write(f"n_estimators: {n_estimators}\n")
+    f.write(f"subsample: {subsample:.6f}\n")
+    f.write(f"colsample_bytree: {colsample_bytree:.6f}\n")
+    f.write(f"best_fitness(1-mean_inner_val_acc): {best_fitness:.6f}\n")
+
+# =============== 最终模型：全训练集重训 + 测试集评估 ===============
+final_scaler = StandardScaler().fit(X_raw_all)
+X_train_full = final_scaler.transform(X_raw_all)
+X_test       = final_scaler.transform(X_test_raw)
+
+final_model = xgb.XGBClassifier(
+    objective='multi:softprob',
+    num_class=4,
+    learning_rate=learning_rate,
+    max_depth=max_depth,
+    n_estimators=n_estimators,
+    subsample=subsample,
+    colsample_bytree=colsample_bytree,
+    tree_method='gpu_hist',
+    predictor='gpu_predictor',
+    random_state=42,
+    eval_metric='mlogloss'
+)
+final_model.fit(X_train_full, y_all)
+
+# =============== 保存模型 + 保存标准化器 ===============
+joblib.dump(final_model,  os.path.join(save_path, "final_model.pkl"))
+joblib.dump(final_scaler, os.path.join(save_path, "final_scaler.pkl"))
+print("\n模型 final_model.pkl 和 标准化器 final_scaler.pkl 已成功保存！")
+
+# ===== 测试集评估 =====
+y_pred       = np.argmax(final_model.predict_proba(X_test), axis=1)
+y_pred_proba = final_model.predict_proba(X_test)
+
+accuracy  = accuracy_score(y_test, y_pred)
+precision = precision_score(y_test, y_pred, average='weighted')
+recall    = recall_score(y_test, y_pred, average='weighted')
+f1        = f1_score(y_test, y_pred, average='weighted')
+report    = classification_report(y_test, y_pred)
+
+with open(os.path.join(save_path, "evaluation_report.txt"), "w", encoding="utf-8") as f:
+    f.write(f"测试集准确率: {accuracy:.4f}\n")
+    f.write(f"测试集查准率: {precision:.4f}\n")
+    f.write(f"测试集召回率: {recall:.4f}\n")
+    f.write(f"测试集F1分数: {f1:.4f}\n\n")
+    f.write("测试集分类报告:\n")
+    f.write(report)
+
+mapping = {0: 'Type1', 1: 'Type2', 2: 'Type3', 3: 'Type4'}
+cm = confusion_matrix(y_test, y_pred)
+
+# 混淆矩阵图
+y_test_mapped = [mapping[i] for i in y_test]
+y_pred_mapped = [mapping[i] for i in y_pred]
+
+plt.figure()
+skplt.metrics.plot_confusion_matrix(y_test_mapped, y_pred_mapped)
+plt.title("XGBoost Confusion Matrix (Test)")
+plt.tight_layout()
+plt.savefig(os.path.join(save_path, "confusion_matrix.png"))
+plt.close()
+
+# 数值热力图
+plt.figure(figsize=(6, 5))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=mapping.values(), yticklabels=mapping.values())
+plt.xlabel('预测标签')
+plt.ylabel('真实标签')
+plt.title('混淆矩阵 (测试集数值)')
+plt.tight_layout()
+plt.savefig(os.path.join(save_path, "confusion_matrix_heatmap.png"))
+plt.show()
+
+# ROC / AUC
+y_test_binary = label_binarize(y_test, classes=[0, 1, 2, 3])
+fpr, tpr, roc_auc = {}, {}, {}
+for i in range(4):
+    fpr[i], tpr[i], _ = roc_curve(y_test_binary[:, i], y_pred_proba[:, i])
+    roc_auc[i] = roc_auc_score(y_test_binary[:, i], y_pred_proba[:, i])
+
+plt.figure(figsize=(10, 8))
+colors = ['red', 'green', 'blue', 'purple']
+for i, color in zip(range(4), colors):
+    plt.plot(fpr[i], tpr[i], color=color, lw=2,
+             label=f'{mapping[i]} (AUC = {roc_auc[i]:.4f})')
+plt.plot([0, 1], [0, 1], 'k--', lw=2)
+plt.xlim([0.0, 1.0]); plt.ylim([0.0, 1.0])
+plt.xlabel('假正例率 (FPR)')
+plt.ylabel('真正例率 (TPR)')
+plt.title('四类别的ROC曲线（测试集）')
+plt.legend(loc="lower right"); plt.grid(True)
+plt.tight_layout()
+plt.savefig(os.path.join(save_path, 'roc_curves.png'))
+plt.show()
+
+# 清理
+del final_model, y_pred, y_pred_proba, cm, y_test_mapped, y_pred_mapped
+gc.collect()
